@@ -1,0 +1,32 @@
+# vendor binaries — not redistributed (licensing + size). drop into docker/pkgs/ locally.
+*.whl
+*.run
+!docker/pkgs/.gitkeep
+
+# python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.ipynb_checkpoints/
+
+# runtime / training artifacts
+*.log
+log_*.txt
+output*/
+*_out/
+profiling/
+prof_*/
+*memory_snapshot*/
+ds_cache*/
+tc_*/
+.triton/
+
+# model weights / checkpoints / data caches
+*.safetensors
+*.bin
+*.pt
+*-dcp/
+
+# os / editor
+.DS_Store
+*.swp
