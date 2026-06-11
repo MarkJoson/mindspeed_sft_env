@@ -18,6 +18,8 @@ One YAML drives everything; the trainer entry is
 | `docker/requirements.lock.txt` | 123-package pinned pip closure |
 | `docker/patches/mindspeed_mm_qwen36_sft.patch` | GDN step-time optimization + profiler instrumentation, applied to MindSpeed-MM `@cd34547` |
 | `smoke/` | minimal 8-card smoke test (random-init dense Qwen3.6, no weights) — confirms the image runs end-to-end |
+| `mn/` | reference 16-card MoE training configs (30k / 32k / 128k / 256k + profiler), paths genericized |
+| `launch/` | `run_16c.sh` (single-node 16-card launcher) + `trainer_wrap.sh` (per-rank triton cache) |
 
 ## Pinned sources
 
