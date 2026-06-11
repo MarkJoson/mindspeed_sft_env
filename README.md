@@ -35,8 +35,8 @@ One YAML drives everything; the trainer entry is
 #    drop them in docker/pkgs/ first, or set FLA_BUILD_MODE=source to build from @eabe36b.
 docker buildx build -t qwen36sft:latest docker/
 
-# 2) smoke test (8x 910B, random init, no weights needed)
-bash smoke/run_smoke.sh        # edit the -v mounts + NIC to your host
+# 2) smoke test (8x 910B, random init, no weights) — run INSIDE the container
+bash smoke/run_smoke.sh        # set MM_DIR + the two paths in cfg_smoke.yaml
 
 # 3) real SFT — follow docs/mindspeed-mm-sft-tutorial.md
 ```

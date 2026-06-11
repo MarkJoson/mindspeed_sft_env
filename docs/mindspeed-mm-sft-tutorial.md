@@ -230,28 +230,15 @@ tools:
 
 ### A. 单机 8 卡（smoke / 开发）
 
-裸机：
+已在容器内，直接跑（`smoke/run_smoke.sh` 就是这条，无 docker 包裹）：
 ```bash
-cd MindSpeed-MM
-export HF_HOME=/tmp/hf TRITON_CACHE_DIR=/tmp/tc
+cd "${MM_DIR:-/workspace/MindSpeed-MM}"
+export HF_HOME=/tmp/hf TRITON_CACHE_DIR=/tmp/tc TASK_QUEUE_ENABLE=0
 python -m torch.distributed.run --nproc_per_node=8 --master_port=29555 \
-  mindspeed_mm/fsdp/train/trainer.py /path/cfg_smoke.yaml
+  mindspeed_mm/fsdp/train/trainer.py /path/to/smoke/cfg_smoke.yaml
 ```
-
-Docker（即 `run_smoke.sh`，挂 8 张卡 + 驱动 + 数据/权重目录）：
-```bash
-docker run --rm --net=host --ipc=host --shm-size=64g \
-  $(for i in 0 1 2 3 4 5 6 7; do echo --device=/dev/davinci$i; done) \
-  --device=/dev/davinci_manager --device=/dev/devmm_svm --device=/dev/hisi_hdc \
-  -v /usr/local/Ascend/driver:/usr/local/Ascend/driver:ro \
-  -v /usr/local/dcmi:/usr/local/dcmi:ro -v /usr/local/bin/npu-smi:/usr/local/bin/npu-smi:ro \
-  -v <权重目录>:/workspace/qwen36-mini:ro -v <smoke目录>:/workspace/smoke \
-  -e HCCL_SOCKET_IFNAME=<网卡> -e GLOO_SOCKET_IFNAME=<网卡> \
-  qwen36sft:latest \
-  bash -lc 'cd /workspace/MindSpeed-MM && \
-    python -m torch.distributed.run --nproc_per_node=8 --master_port=29555 \
-      mindspeed_mm/fsdp/train/trainer.py /workspace/smoke/cfg_smoke.yaml'
-```
+> 仅当从**宿主机**起容器时才需要 `docker run ...`（挂 8 卡 + 驱动 + 数据/权重目录 + NIC，
+> 见旧 `run_smoke.sh` 历史）；已在容器里就跳过这层，直接用上面这条。
 
 ### B. 双机 16 卡（MoE 生产，即 `run_moe.sh`）
 
@@ -266,12 +253,33 @@ python3 -m torch.distributed.run --nnodes=2 --node_rank=$NR --nproc_per_node=8 -
 两个节点分别执行（同一 MASTER_ADDR/PORT，node_rank 0 / 1）：
 ```bash
 # 节点0（master）
-MASTER_ADDR=10.0.4.98 MASTER_PORT=29761 bash run_moe.sh 0 moe_30k 1800
+MASTER_ADDR=<master-ip> MASTER_PORT=29761 bash run_moe.sh 0 moe_30k 1800
 # 节点1
-MASTER_ADDR=10.0.4.98 MASTER_PORT=29761 bash run_moe.sh 1 moe_30k 1800
+MASTER_ADDR=<master-ip> MASTER_PORT=29761 bash run_moe.sh 1 moe_30k 1800
 ```
 > `TRITON_CACHE_BASE=/tmp/tc_<cfg>` **持久化复用，别每次 `rm -rf`**——首跑 triton 编译很慢
 > （30k/卡 ~5min），删了等于每次重编译。
+
+### C. 单机 16 卡（同一台 16 卡机）
+
+**配置 YAML 完全不变**：world_size 还是 16（1 节点 × 16 进程），`fully_shard_parallel_size: auto`
+照样 →16，dp/ulysses/ep 一个不动，直接复用 `cfg_moe_30k.yaml` 等。**只是启动从两次变一次**，
+去掉 `node_rank` / `master_addr`：
+```bash
+cd "${MM_DIR:-/workspace/MindSpeed-MM}"
+export TASK_QUEUE_ENABLE=0
+export LD_LIBRARY_PATH=/usr/local/Ascend/cann-9.0.0/opp/vendors/fla_npu_transformer/op_api/lib:$LD_LIBRARY_PATH
+export TRITON_CACHE_BASE=/tmp/tc_moe_30k
+python3 -m torch.distributed.run --nnodes=1 --nproc_per_node=16 --master_port=29761 \
+  --no-python launch/trainer_wrap.sh mn/cfg_moe_30k.yaml
+```
+仓库 `launch/run_16c.sh` 就是这条的封装（`run_16c.sh <cfg.yaml> [timeout]`）。要点：
+> - 前置：`npu-smi info` 能看到 16 张卡。
+> - 16 进程共用一个文件系统 → **per-rank `TRITON_CACHE_DIR`**（`trainer_wrap.sh` 设 `…/rank$RANK`），
+>   否则首跑编译会抢同一 cache。
+> - 全部通讯走节点内 HCCS，无跨机 RDMA，省掉 `HCCL_SOCKET_IFNAME`/超时那套。若机器是 2×8
+>   （双 board），跨组 HCCS 带宽低于组内，FSDP 16-way all-gather 会跨它——但 profiler 显示跨机
+>   RDMA 本就只占 ~13.5/189 GB，单机化主要是简化启动，吞吐不会大变。
 
 ---
 
