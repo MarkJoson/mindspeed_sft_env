@@ -1,3 +1,152 @@
+diff --git a/mindspeed_mm/fsdp/features/memory/chunkloss/fused_lm_ce.py b/mindspeed_mm/fsdp/features/memory/chunkloss/fused_lm_ce.py
+new file mode 100644
+index 00000000..90dfdd83
+--- /dev/null
++++ b/mindspeed_mm/fsdp/features/memory/chunkloss/fused_lm_ce.py
+@@ -0,0 +1,68 @@
++# Copyright (c) 2026. Fused linear cross-entropy for the LM head, memory-optimized.
++# Drop-in replacement for chunk_loss(calculate_lm_loss) on the "sum"-reduction (default loss_type) path.
++# Uses torch_npu.npu_cross_entropy_loss (fused log_softmax+nll) + in-place addmm_ for grad_weight,
++# so it NEVER materializes the full [vocab, hidden] per-chunk weight-gradient (the ~970MB transient
++# that grad_and_value produces). Validated bit-exact vs the original (loss diff 0, grads ~1e-7).
++import torch
++
++# Number of vocab blocks for the grad_weight accumulation (keeps each [V/N, H] product small).
++_GW_BLOCKS = 8
++
++
++class FusedChunkLMLoss(torch.autograd.Function):
++    """Chunked LM cross-entropy. Precomputes grads in forward (like the original ChunkLoss),
++    but with fused ops + in-place weight-grad accumulation (no full-weight-grad transient)."""
++
++    @staticmethod
++    def forward(ctx, hidden_states, head_weight, head_bias, loss_kwargs_chunks, chunk_size):
++        if head_bias is not None:
++            raise NotImplementedError("head_bias is not supported in FusedChunkLMLoss")
++        grad_inputs = torch.empty_like(hidden_states)
++        grad_weight = torch.zeros_like(head_weight)
++        accumulated_loss = torch.zeros((), device=hidden_states.device)
++
++        gi_chunks = torch.split(grad_inputs, chunk_size, dim=1)
++        h_chunks = torch.split(hidden_states, chunk_size, dim=1)
++
++        for h_c, gi_c, kw in zip(h_chunks, gi_chunks, loss_kwargs_chunks):
++            ign = kw["ignore_index"]
++            alpha = kw["alpha"]                      # "default": scalar = #valid tokens
++            sl = kw["shift_labels"].reshape(-1)
++            h2d = h_c.reshape(-1, h_c.size(-1))
++            logits = torch.nn.functional.linear(h2d, head_weight).float()         # [c, V]
++            loss, log_prob, _, _ = torch.ops.npu.npu_cross_entropy_loss(
++                logits, sl, reduction="sum", ignore_index=ign)
++            accumulated_loss += (loss / alpha).reshape(())
++            inv_a = (1.0 / alpha) if torch.is_tensor(alpha) else torch.tensor(1.0 / alpha, device=h2d.device)
++            grad_loss = inv_a.to(log_prob.dtype).reshape(1)
++            grad_logits = torch.ops.npu.npu_cross_entropy_loss_backward(
++                grad_loss, log_prob, sl, reduction="sum", ignore_index=ign)       # [c, V]
++            g_bf = grad_logits.to(head_weight.dtype)                              # bf16, matches reference's F.linear bwd
++            gi_c.copy_((g_bf @ head_weight).view_as(gi_c))                         # grad_input: bf16 matmul, NO fp32 weight copy
++            # grad_weight += g_bf.T @ h2d, accumulated in VOCAB BLOCKS so the [V,H] product is
++            # never materialized whole (NPU addmm_ is NOT truly in-place -> a full [V,H] temp ~970MB).
++            V = head_weight.size(0)
++            vb = (V + _GW_BLOCKS - 1) // _GW_BLOCKS
++            for vs in range(0, V, vb):
++                ve = min(vs + vb, V)
++                grad_weight[vs:ve].addmm_(g_bf[:, vs:ve].t(), h2d)                 # per-block product [<=V/8, H] ~120MB
++
++        ctx.save_for_backward(grad_inputs, grad_weight)
++        return accumulated_loss
++
++    @staticmethod
++    def backward(ctx, grad_output):
++        grad_input, grad_weight = ctx.saved_tensors
++        if not torch.equal(grad_output, torch.ones_like(grad_output)):
++            grad_input = grad_input * grad_output
++            grad_weight = grad_weight * grad_output
++        return grad_input, grad_weight, None, None, None
++
++
++def fused_chunk_lm_loss(hidden_states, head_weight, head_bias, loss_kwargs_chunks, chunk_size):
++    return FusedChunkLMLoss.apply(hidden_states, head_weight, head_bias, loss_kwargs_chunks, chunk_size)
++
++
++def can_use_fused(loss_kwargs_chunks):
++    """Fused path currently supports reduction='sum' (loss_type 'default'/'per_token')."""
++    return len(loss_kwargs_chunks) > 0 and all(kw.get("reduction") == "sum" for kw in loss_kwargs_chunks)
+diff --git a/mindspeed_mm/fsdp/features/memory/chunkloss/fused_lm_ce_maxsum.py b/mindspeed_mm/fsdp/features/memory/chunkloss/fused_lm_ce_maxsum.py
+new file mode 100644
+index 00000000..1536f3c9
+--- /dev/null
++++ b/mindspeed_mm/fsdp/features/memory/chunkloss/fused_lm_ce_maxsum.py
+@@ -0,0 +1,52 @@
++# Truly-fused linear-CE via torch_npu with_max_sum ops (fused backward, no grad_logits materialized).
++# Forward op: fused_cross_entropy_loss_with_max_sum ; backward op: fused_linear_cross_entropy_loss_with_max_sum_grad.
++import torch
++
++
++class FusedChunkLMLossMaxSum(torch.autograd.Function):
++    @staticmethod
++    def forward(ctx, hidden_states, head_weight, head_bias, loss_kwargs_chunks, chunk_size):
++        if head_bias is not None:
++            raise NotImplementedError("head_bias not supported")
++        grad_inputs = torch.empty_like(hidden_states)
++        grad_weight = torch.zeros_like(head_weight)
++        acc = torch.zeros((), device=hidden_states.device)
++        gi_chunks = torch.split(grad_inputs, chunk_size, dim=1)
++        h_chunks = torch.split(hidden_states, chunk_size, dim=1)
++        V = head_weight.size(0)
++        for h_c, gi_c, kw in zip(h_chunks, gi_chunks, loss_kwargs_chunks):
++            ign = kw["ignore_index"]; alpha = kw["alpha"]
++            sl = kw["shift_labels"].reshape(-1)
++            h2d = h_c.reshape(-1, h_c.size(-1))
++            # forward preprocessing (single partition [0,V)); the [c,V] logits are transient
++            logits = torch.nn.functional.linear(h2d, head_weight).float()
++            logits_max = logits.max(dim=-1).values
++            tmask = (sl == ign)
++            masked_target = sl.clone(); masked_target[tmask] = 0
++            shifted = logits - logits_max.unsqueeze(-1)
++            ar = torch.arange(h2d.size(0), device=h2d.device)
++            predicted = shifted[ar, masked_target] * (~tmask)
++            sum_exp = torch.exp(shifted).sum(dim=-1)
++            del logits, shifted
++            loss_vec, _ = torch.ops.npu.fused_cross_entropy_loss_with_max_sum(logits_max, sum_exp, predicted)
++            acc += (loss_vec * (~tmask)).sum() / alpha
++            # fused backward: produces grad_input [c,H] + grad_weight [V,H] directly (no grad_logits)
++            grad_loss = ((~tmask).to(torch.float32) / alpha)
++            gi, gw = torch.ops.npu.fused_linear_cross_entropy_loss_with_max_sum_grad(
++                grad_loss, h2d, head_weight, tmask, masked_target, 0.0,
++                logits_max=logits_max, sum_exp_logits=sum_exp)
++            gi_c.copy_(gi.to(hidden_states.dtype).view_as(gi_c))
++            grad_weight.add_(gw.to(head_weight.dtype))
++        ctx.save_for_backward(grad_inputs, grad_weight)
++        return acc
++
++    @staticmethod
++    def backward(ctx, grad_output):
++        gi, gw = ctx.saved_tensors
++        if not torch.equal(grad_output, torch.ones_like(grad_output)):
++            gi = gi * grad_output; gw = gw * grad_output
++        return gi, gw, None, None, None
++
++
++def fused_chunk_lm_loss_maxsum(hidden_states, head_weight, head_bias, loss_kwargs_chunks, chunk_size):
++    return FusedChunkLMLossMaxSum.apply(hidden_states, head_weight, head_bias, loss_kwargs_chunks, chunk_size)
+diff --git a/mindspeed_mm/fsdp/loss/loss_func.py b/mindspeed_mm/fsdp/loss/loss_func.py
+index 5cd8aabf..df51b767 100644
+--- a/mindspeed_mm/fsdp/loss/loss_func.py
++++ b/mindspeed_mm/fsdp/loss/loss_func.py
+@@ -167,6 +167,12 @@ def build_loss_func(
+                 **_kwargs,
+             )
+ 
++            from mindspeed_mm.fsdp.features.memory.chunkloss.fused_lm_ce import (
++                fused_chunk_lm_loss, can_use_fused)
++            if can_use_fused(loss_func_kwargs):
++                return fused_chunk_lm_loss(
++                    hidden_states, head_weight, head_bias,
++                    loss_func_kwargs, loss_func_kwargs[0]["chunk_size"])
+             return chunk_loss(
+                 hidden_states,
+                 head_weight,
 diff --git a/mindspeed_mm/fsdp/models/qwen3_5/modeling_qwen3_5.py b/mindspeed_mm/fsdp/models/qwen3_5/modeling_qwen3_5.py
 index c9ab52d0..e0882108 100644
 --- a/mindspeed_mm/fsdp/models/qwen3_5/modeling_qwen3_5.py
@@ -74,6 +223,18 @@ index c9ab52d0..e0882108 100644
              position_ids=position_ids,
              pixel_values=pixel_values,
              pixel_values_videos=pixel_values_videos,
+diff --git a/mindspeed_mm/fsdp/models/qwen3_5_moe/modeling_qwen3_5_moe.py b/mindspeed_mm/fsdp/models/qwen3_5_moe/modeling_qwen3_5_moe.py
+index 584f766c..fce2ad6d 100644
+--- a/mindspeed_mm/fsdp/models/qwen3_5_moe/modeling_qwen3_5_moe.py
++++ b/mindspeed_mm/fsdp/models/qwen3_5_moe/modeling_qwen3_5_moe.py
+@@ -1901,7 +1901,6 @@ class Qwen3_5MoeTextModel(Qwen3_5MoePreTrainedModel):
+                 config=self.config,
+                 inputs_embeds=inputs_embeds,
+                 attention_mask=attention_mask,
+-                cache_position=cache_position,
+                 past_key_values=past_key_values,
+                 position_ids=text_position_ids,
+             )
 diff --git a/mindspeed_mm/fsdp/ops/flash_attn/flash_attn.py b/mindspeed_mm/fsdp/ops/flash_attn/flash_attn.py
 index 959f3365..1e0d9a7f 100644
 --- a/mindspeed_mm/fsdp/ops/flash_attn/flash_attn.py

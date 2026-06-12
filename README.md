@@ -16,7 +16,8 @@ One YAML drives everything; the trainer entry is
 | `docker/Dockerfile` | the validated image (CANN 9.0.0 / torch 2.10.0 / torch_npu 2.10.0 / triton-ascend 3.2.1 + MindSpeed-MM + fla_npu) |
 | `docker/entrypoint.sh` | sources CANN, wires the fla_npu vendor lib, sets the validated runtime env |
 | `docker/requirements.lock.txt` | 123-package pinned pip closure |
-| `docker/patches/mindspeed_mm_qwen36_sft.patch` | GDN step-time optimization + profiler instrumentation, applied to MindSpeed-MM `@cd34547` |
+| `patches/mindspeed-mm-qwen36-sft.patch` | full changeset over MindSpeed-MM `@cd34547` — GDN step-opt + **MoE create_causal_mask fix** + fused CE (14 files) |
+| `FORK.md` | how to apply that patch as the `MarkJoson/MindSpeed-MM` fork branch the image clones |
 | `smoke/` | minimal 8-card smoke test (random-init dense Qwen3.6, no weights) — confirms the image runs end-to-end |
 | `mn/` | reference 16-card MoE training configs (30k / 32k / 128k / 256k + profiler), paths genericized |
 | `launch/` | `run_16c.sh` (single-node 16-card launcher) + `trainer_wrap.sh` (per-rank triton cache) |
@@ -27,14 +28,15 @@ One YAML drives everything; the trainer entry is
 |---|---|---|
 | transformers | github huggingface/transformers | `94246e68` |
 | MindSpeed | gitcode Ascend/MindSpeed | `5753d412` |
-| MindSpeed-MM | github Ascend/MindSpeed-MM | `cd345479` **+ patch** |
+| MindSpeed-MM | **fork** github MarkJoson/MindSpeed-MM @ `qwen36-sft` | = Ascend `cd345479` + `patches/` (see FORK.md) |
 | flash-linear-attention-npu | github flashserve/flash-linear-attention-npu | `eabe36b` |
 
 ## Quickstart
 
 ```bash
-# 1) build the image (BuildKit). fla_npu vendor blobs are NOT redistributed here —
-#    drop them in docker/pkgs/ first, or set FLA_BUILD_MODE=source to build from @eabe36b.
+# 0) one-time: create the MarkJoson/MindSpeed-MM `qwen36-sft` fork branch — see FORK.md.
+# 1) build the image. it clones that fork branch (no patch step). fla_npu vendor blobs are
+#    NOT redistributed — drop them in docker/pkgs/ first, or set FLA_BUILD_MODE=source.
 docker buildx build -t qwen36sft:latest docker/
 
 # 2) smoke test (8x 910B, random init, no weights) — run INSIDE the container
